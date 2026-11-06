@@ -115,7 +115,9 @@ service.interceptors.response.use(
                 tags: { api: config.url || '', biz_code: String(data.code) }
             })
         }
-        ElMessage.error(data.msg || '系统错误')
+        if (!config.silent) {
+            ElMessage.error(data.msg || '系统错误')
+        }
         return Promise.reject(new Error(data.msg || '系统错误'))
     },
     (error) => {
@@ -130,10 +132,12 @@ service.interceptors.response.use(
             return Promise.reject(error)
         }
 
-        if (error.code === 'ECONNABORTED') {
-            ElMessage.error('请求超时，请稍后重试')
-        } else {
-            ElMessage.error(serverMsg || '网络请求失败')
+        if (!error.config?.silent) {
+            if (error.code === 'ECONNABORTED') {
+                ElMessage.error('请求超时，请稍后重试')
+            } else {
+                ElMessage.error(serverMsg || '网络请求失败')
+            }
         }
         return Promise.reject(error)
     }
