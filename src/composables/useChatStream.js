@@ -15,25 +15,21 @@ export const STREAM_STATUS = Object.freeze({
   ERROR: 'error'
 })
 
-// 迁移白名单：只有表里写明的边才允许走，其余一律拦截。
-// 终态之间不允许互跳（已被停止的不会因为迟到的 onclose 又变成 done），
-// 只允许重新发起连接——这让“停止后又收到完成回调”这类竞态在状态层就断掉。
-const TRANSITIONS = Object.freeze({
-  [STREAM_STATUS.IDLE]: [STREAM_STATUS.CONNECTING],
-  [STREAM_STATUS.CONNECTING]: [
-    STREAM_STATUS.STREAMING,
-    STREAM_STATUS.DONE,
-    STREAM_STATUS.ABORTED,
-    STREAM_STATUS.ERROR
-  ],
-  [STREAM_STATUS.STREAMING]: [
-    STREAM_STATUS.DONE,
-    STREAM_STATUS.ABORTED,
-    STREAM_STATUS.ERROR
-  ],
-  [STREAM_STATUS.DONE]: [STREAM_STATUS.CONNECTING],
-  [STREAM_STATUS.ABORTED]: [STREAM_STATUS.CONNECTING],
-  [STREAM_STATUS.ERROR]: [STREAM_STATUS.CONNECTING]
+// 事件字母表：状态机只认这些输入。
+// 回调与用户操作都先翻译成事件，再由迁移表决定走到哪、进状态时做什么。
+export const STREAM_EVENT = Object.freeze({
+  START: 'start',
+  OPEN_OK: 'open-ok',
+  OPEN_UNAUTHORIZED: 'open-unauthorized',
+  OPEN_INVALID: 'open-invalid',
+  CHUNK: 'chunk',
+  DONE: 'done',
+  CLOSE: 'close',
+  SETTLED: 'settled',
+  FAIL: 'fail',
+  STOP: 'stop',
+  ABORT: 'abort',
+  RESET: 'reset'
 })
 
 /**
@@ -43,8 +39,10 @@ const TRANSITIONS = Object.freeze({
  * 组件只通过回调拿到"当前累计文本 / 结束 / 中止 / 失败"。
  *
  * 状态机：idle -> connecting -> streaming -> done | aborted | error
- * 每次迁移都要过白名单，叠加 generation 代数守卫：
- * 白名单管“这个迁移合不合法”，代数管“这个回调是不是上一代的”。
+ * 迁移表同时决定“走不走 / 走到哪 / 进状态时执行什么副作用”，
+ * 回调只负责把原始信号翻译成事件，不再各自携带策略。
+ * 表里没有的格子 = 显式忽略（例如停止之后又到达的 done / chunk）。
+ * 另叠加 generation 代数守卫，在事件投递入口就把上一代事件过滤掉。
  */
 export function useChatStream({
   transport = fetchEventSource,
@@ -64,20 +62,6 @@ export function useChatStream({
       status.value === STREAM_STATUS.ABORTED ||
       status.value === STREAM_STATUS.ERROR
   )
-
-  // 状态迁移的唯一入口：非法边直接丢弃，开发态告警便于尽早发现回调顺序错乱
-  const transition = (next) => {
-    const from = status.value
-    if (from === next) return true
-    if (!TRANSITIONS[from]?.includes(next)) {
-      if (import.meta.env?.DEV) {
-        console.warn(`[useChatStream] 非法状态迁移已拦截: ${from} -> ${next}`)
-      }
-      return false
-    }
-    status.value = next
-    return true
-  }
 
   let controller = null
   let buffer = ''
@@ -108,13 +92,239 @@ export function useChatStream({
     clearFlushTimer()
   }
 
-  // 失败但保留已生成内容：先把缓冲落盘，再通知组件
-  const fail = (generationAtStart, message) => {
-    if (generationAtStart !== generation) return
+  // 静默掐掉在途连接：不迁移状态、不触发回调，由调用方决定去向
+  const abandonActive = (shouldAbort) => {
+    if (!shouldAbort) return
+    const currentController = controller
+    controller = null
+    generation += 1
+    discardBuffer()
+    currentController?.abort()
+  }
+
+  const begin = (payload) => {
+    const currentGeneration = ++generation
+    const currentController = new AbortController()
+    controller = currentController
+    handlers = payload.handlers
+    content.value = ''
+    error.value = null
+    discardBuffer()
+
+    transport(endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Token: payload.token,
+        Accept: 'text/event-stream'
+      },
+      body: JSON.stringify({ sessionId: payload.sessionId, userMessage: payload.userMessage }),
+      signal: currentController.signal,
+      onopen: (response) => {
+        if (currentGeneration !== generation) return
+
+        if (response.status === 401 || response.status === 403) {
+          dispatch(STREAM_EVENT.OPEN_UNAUTHORIZED, { generation: currentGeneration })
+          return
+        }
+
+        const contentType = response.headers.get('Content-Type') || ''
+        if (!response.ok || !contentType.includes('text/event-stream')) {
+          dispatch(STREAM_EVENT.OPEN_INVALID, {
+            generation: currentGeneration,
+            message: '服务器响应异常，请稍后重试'
+          })
+          return
+        }
+
+        dispatch(STREAM_EVENT.OPEN_OK, { generation: currentGeneration })
+      },
+      onmessage: (event) => {
+        if (currentGeneration !== generation) return
+
+        const raw = event.data.trim()
+        if (!raw) return
+
+        if (event.event === 'done') {
+          dispatch(STREAM_EVENT.DONE, { generation: currentGeneration })
+          return
+        }
+
+        try {
+          const payload = JSON.parse(raw)
+          const ok = String(payload.code) === '200'
+          if (ok && payload.data && payload.data.content) {
+            dispatch(STREAM_EVENT.CHUNK, {
+              generation: currentGeneration,
+              text: payload.data.content
+            })
+          } else {
+            dispatch(STREAM_EVENT.FAIL, {
+              generation: currentGeneration,
+              message: payload.message || 'AI回复失败'
+            })
+          }
+        } catch (err) {
+          console.error('解析流式数据异常:', err)
+        }
+      },
+      onerror: (err) => {
+        if (currentGeneration !== generation) return
+        // 主动中止不是错误：由 STOP / ABORT 负责收尾
+        if (err?.name === 'AbortError') return
+        console.error('SSE 连接异常:', err)
+        dispatch(STREAM_EVENT.FAIL, {
+          generation: currentGeneration,
+          message: '网络连接中断或AI回复失败'
+        })
+        // 抛出让 fetch-event-source 停止重连
+        throw err
+      },
+      onclose: () => {
+        if (currentGeneration !== generation) return
+        dispatch(STREAM_EVENT.CLOSE, { generation: currentGeneration })
+      }
+    })
+      .catch(() => {
+        // 中止与错误已由统一回调处理，这里只消费 Promise rejection
+      })
+      .finally(() => {
+        if (currentGeneration !== generation) return
+        dispatch(STREAM_EVENT.SETTLED, { generation: currentGeneration })
+      })
+  }
+
+  // 生成中再次发起：先静默掐掉上一代，再开新连接
+  const restart = (payload) => {
+    abandonActive(true)
+    begin(payload)
+  }
+
+  const append = (payload) => {
+    if (!payload?.text) return
+    buffer += payload.text
+    if (flushTimer) return
+    const currentGeneration = generation
+    flushTimer = setTimeout(() => {
+      flushTimer = null
+      if (currentGeneration === generation) flush()
+    }, STREAM_FLUSH_INTERVAL)
+  }
+
+  // 收到 done 事件：落盘缓冲、通知组件、主动关流
+  const finish = () => {
     flush()
+    handlers.onDone?.()
+    controller?.abort()
+  }
+
+  // 连接被关闭 / Promise 落定但还在生成中：只落盘，不回调
+  const settleActive = () => {
+    flush()
+    controller = null
+  }
+
+  // 终态之后 Promise 才落定：只清引用，不再触发任何行为
+  const settle = () => {
+    controller = null
+  }
+
+  const failWith = (payload) => {
+    flush()
+    const message = payload?.message || 'AI回复失败'
     error.value = message
-    transition(STREAM_STATUS.ERROR)
     handlers.onError?.(message, content.value)
+    controller?.abort()
+  }
+
+  const unauthorized = () => {
+    discardBuffer()
+    const message = '登录已过期，请重新登录'
+    error.value = message
+    handlers.onUnauthorized?.()
+    controller?.abort()
+  }
+
+  // 用户主动停止：保留已生成内容，通知组件收尾
+  const stopActive = () => {
+    const currentController = controller
+    controller = null
+    flush()
+    generation += 1
+    currentController?.abort()
+    handlers.onAbort?.(content.value)
+  }
+
+  // 硬重置：掐掉在途流并回到 idle
+  const resetAll = (_payload, from) => {
+    abandonActive(from === STREAM_STATUS.CONNECTING || from === STREAM_STATUS.STREAMING)
+    content.value = ''
+    error.value = null
+    handlers = {}
+  }
+
+  // 迁移表：(状态, 事件) -> { 目标状态, 进入目标状态时执行的副作用 }
+  // 未列出的格子视为显式忽略，不再需要在各回调里散写 isActive 判断。
+  const table = Object.freeze({
+    [STREAM_STATUS.IDLE]: {
+      [STREAM_EVENT.START]: { to: STREAM_STATUS.CONNECTING, effect: begin },
+      [STREAM_EVENT.RESET]: { to: STREAM_STATUS.IDLE, effect: resetAll },
+      [STREAM_EVENT.SETTLED]: { to: STREAM_STATUS.IDLE, effect: settle }
+    },
+    [STREAM_STATUS.CONNECTING]: {
+      [STREAM_EVENT.START]: { to: STREAM_STATUS.CONNECTING, effect: restart },
+      [STREAM_EVENT.OPEN_OK]: { to: STREAM_STATUS.STREAMING },
+      [STREAM_EVENT.OPEN_UNAUTHORIZED]: { to: STREAM_STATUS.ERROR, effect: unauthorized },
+      [STREAM_EVENT.OPEN_INVALID]: { to: STREAM_STATUS.ERROR, effect: failWith },
+      [STREAM_EVENT.CHUNK]: { to: STREAM_STATUS.STREAMING, effect: append },
+      [STREAM_EVENT.DONE]: { to: STREAM_STATUS.DONE, effect: finish },
+      [STREAM_EVENT.CLOSE]: { to: STREAM_STATUS.DONE, effect: flush },
+      [STREAM_EVENT.SETTLED]: { to: STREAM_STATUS.DONE, effect: settleActive },
+      [STREAM_EVENT.FAIL]: { to: STREAM_STATUS.ERROR, effect: failWith },
+      [STREAM_EVENT.STOP]: { to: STREAM_STATUS.ABORTED, effect: stopActive },
+      [STREAM_EVENT.ABORT]: { to: STREAM_STATUS.ABORTED, effect: () => abandonActive(true) },
+      [STREAM_EVENT.RESET]: { to: STREAM_STATUS.IDLE, effect: resetAll }
+    },
+    [STREAM_STATUS.STREAMING]: {
+      [STREAM_EVENT.START]: { to: STREAM_STATUS.CONNECTING, effect: restart },
+      [STREAM_EVENT.CHUNK]: { to: STREAM_STATUS.STREAMING, effect: append },
+      [STREAM_EVENT.DONE]: { to: STREAM_STATUS.DONE, effect: finish },
+      [STREAM_EVENT.CLOSE]: { to: STREAM_STATUS.DONE, effect: flush },
+      [STREAM_EVENT.SETTLED]: { to: STREAM_STATUS.DONE, effect: settleActive },
+      [STREAM_EVENT.FAIL]: { to: STREAM_STATUS.ERROR, effect: failWith },
+      [STREAM_EVENT.STOP]: { to: STREAM_STATUS.ABORTED, effect: stopActive },
+      [STREAM_EVENT.ABORT]: { to: STREAM_STATUS.ABORTED, effect: () => abandonActive(true) },
+      [STREAM_EVENT.RESET]: { to: STREAM_STATUS.IDLE, effect: resetAll }
+    },
+    [STREAM_STATUS.DONE]: {
+      [STREAM_EVENT.START]: { to: STREAM_STATUS.CONNECTING, effect: begin },
+      [STREAM_EVENT.RESET]: { to: STREAM_STATUS.IDLE, effect: resetAll },
+      [STREAM_EVENT.SETTLED]: { to: STREAM_STATUS.DONE, effect: settle }
+    },
+    [STREAM_STATUS.ABORTED]: {
+      [STREAM_EVENT.START]: { to: STREAM_STATUS.CONNECTING, effect: begin },
+      [STREAM_EVENT.RESET]: { to: STREAM_STATUS.IDLE, effect: resetAll },
+      [STREAM_EVENT.SETTLED]: { to: STREAM_STATUS.ABORTED, effect: settle }
+    },
+    [STREAM_STATUS.ERROR]: {
+      [STREAM_EVENT.START]: { to: STREAM_STATUS.CONNECTING, effect: begin },
+      [STREAM_EVENT.RESET]: { to: STREAM_STATUS.IDLE, effect: resetAll },
+      [STREAM_EVENT.SETTLED]: { to: STREAM_STATUS.ERROR, effect: settle }
+    }
+  })
+
+  // 状态迁移与副作用的唯一入口
+  const dispatch = (event, payload = {}) => {
+    // 代数守卫：上一代的事件连迁移表都进不了
+    if (payload.generation !== undefined && payload.generation !== generation) return false
+
+    const from = status.value
+    const edge = table[from]?.[event]
+    if (!edge) return false
+
+    status.value = edge.to
+    edge.effect?.(payload, from)
+    return true
   }
 
   const start = ({
@@ -127,147 +337,24 @@ export function useChatStream({
     onError,
     onUnauthorized
   }) => {
-    // 上一代还在跑就先静默掐掉，避免两代同时写 content
-    if (controller) abort()
-
-    const currentGeneration = ++generation
-    const currentController = new AbortController()
-    const currentHandlers = { onUpdate, onDone, onAbort, onError, onUnauthorized }
-
-    controller = currentController
-    handlers = currentHandlers
-    content.value = ''
-    error.value = null
-    transition(STREAM_STATUS.CONNECTING)
-    discardBuffer()
-
-    transport(endpoint, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Token: token,
-        Accept: 'text/event-stream'
-      },
-      body: JSON.stringify({ sessionId, userMessage }),
-      signal: currentController.signal,
-      onopen: (response) => {
-        if (currentGeneration !== generation) return
-
-        if (response.status === 401 || response.status === 403) {
-          discardBuffer()
-          transition(STREAM_STATUS.ERROR)
-          currentHandlers.onUnauthorized?.()
-          currentController.abort()
-          return
-        }
-
-        const contentType = response.headers.get('Content-Type') || ''
-        if (!response.ok || !contentType.includes('text/event-stream')) {
-          fail(currentGeneration, '服务器响应异常，请稍后重试')
-          currentController.abort()
-        } else {
-          transition(STREAM_STATUS.STREAMING)
-        }
-      },
-      onmessage: (event) => {
-        if (currentGeneration !== generation) return
-
-        const raw = event.data.trim()
-        if (!raw) return
-
-        if (event.event === 'done') {
-          flush()
-          transition(STREAM_STATUS.DONE)
-          currentHandlers.onDone?.()
-          currentController.abort()
-          return
-        }
-
-        try {
-          const payload = JSON.parse(raw)
-          const ok = String(payload.code) === '200'
-          if (ok && payload.data && payload.data.content) {
-            // 已进入终态的流不再接受增量，避免停止后又被追加内容
-            if (!isActive.value) return
-            buffer += payload.data.content
-            transition(STREAM_STATUS.STREAMING)
-            if (!flushTimer) {
-              flushTimer = setTimeout(() => {
-                flushTimer = null
-                if (currentGeneration === generation) flush()
-              }, STREAM_FLUSH_INTERVAL)
-            }
-          } else {
-            fail(currentGeneration, payload.message || 'AI回复失败')
-            // 已经判定失败，不再接受后续增量
-            currentController.abort()
-          }
-        } catch (err) {
-          console.error('解析流式数据异常:', err)
-        }
-      },
-      onerror: (err) => {
-        if (currentGeneration !== generation) return
-        // 主动中止不是错误：由 stop() / abort() 负责收尾
-        if (err?.name === 'AbortError') return
-        console.error('SSE 连接异常:', err)
-        fail(currentGeneration, '网络连接中断或AI回复失败')
-        currentController.abort()
-        throw err
-      },
-      onclose: () => {
-        if (currentGeneration !== generation) return
-        // 只有还在进行中的流才需要被 onclose 收尾，终态一律不动
-        if (!isActive.value) return
-        flush()
-        transition(STREAM_STATUS.DONE)
-      }
-    }).catch(() => {
-      // 中止与错误已由统一回调处理，这里只消费 Promise rejection
-    }).finally(() => {
-      if (currentGeneration !== generation) return
-      if (isActive.value) {
-        flush()
-        transition(STREAM_STATUS.DONE)
-      }
-      if (controller === currentController) controller = null
+    dispatch(STREAM_EVENT.START, {
+      sessionId,
+      userMessage,
+      token,
+      handlers: { onUpdate, onDone, onAbort, onError, onUnauthorized }
     })
   }
 
   // 用户主动停止：保留已生成内容，通知组件收尾
-  const stop = () => {
-    if (!isActive.value) return false
-
-    const currentController = controller
-    controller = null
-    flush()
-    generation += 1
-    currentController?.abort()
-    transition(STREAM_STATUS.ABORTED)
-    handlers.onAbort?.(content.value)
-    return true
-  }
+  const stop = () => dispatch(STREAM_EVENT.STOP)
 
   // 静默中止：切换会话、卸载组件时用，不触发任何回调
   const abort = () => {
-    // 已经是终态就没有需要中止的流，避免把 done/error 误改成 aborted
-    if (!isActive.value) return
-
-    const currentController = controller
-    controller = null
-    generation += 1
-    discardBuffer()
-    currentController?.abort()
-    transition(STREAM_STATUS.ABORTED)
+    dispatch(STREAM_EVENT.ABORT)
   }
 
   const reset = () => {
-    abort()
-    content.value = ''
-    error.value = null
-    // 硬重置是唯一绕过迁移表的路径，用于组件初始化
-    status.value = STREAM_STATUS.IDLE
-    handlers = {}
+    dispatch(STREAM_EVENT.RESET)
   }
 
   return {
